@@ -40,8 +40,11 @@ os.environ.setdefault("XDG_CACHE_HOME", str(CACHE_DIR / "xdg"))
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import LightSource
 from matplotlib.lines import Line2D
 from matplotlib.patches import Circle, Polygon, Rectangle, Wedge
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from mpl_toolkits.mplot3d import proj3d
 
 
 SUBSYSTEM_COLORS = {
@@ -888,44 +891,113 @@ def surface_for_annular_sector(
     return x, y, z
 
 
+def surface_grid_faces(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> list[list[tuple[float, float, float]]]:
+    faces: list[list[tuple[float, float, float]]] = []
+    for row in range(x.shape[0] - 1):
+        for col in range(x.shape[1] - 1):
+            faces.append(
+                [
+                    (float(x[row, col]), float(y[row, col]), float(z[row, col])),
+                    (float(x[row + 1, col]), float(y[row + 1, col]), float(z[row + 1, col])),
+                    (float(x[row + 1, col + 1]), float(y[row + 1, col + 1]), float(z[row + 1, col + 1])),
+                    (float(x[row, col + 1]), float(y[row, col + 1]), float(z[row, col + 1])),
+                ]
+            )
+    return faces
+
+
+def add_tracker_surface_collection(
+    ax: plt.Axes,
+    faces: list[list[tuple[float, float, float]]],
+    facecolors: list[str],
+    lightsource: LightSource,
+) -> None:
+    surface_collection = Poly3DCollection(
+        np.asarray(faces, dtype=float),
+        facecolors=facecolors,
+        linewidths=0,
+        alpha=1.0,
+        antialiaseds=False,
+        shade=True,
+        lightsource=lightsource,
+        zsort="average",
+    )
+    ax.add_collection3d(surface_collection)
+
+
+def projected_leftmost_barrel_point(
+    ax: plt.Axes,
+    layer: BarrelLayer,
+    phi: np.ndarray,
+) -> tuple[float, float, float]:
+    x_samples = np.linspace(0.0, layer.z_half, 72)
+    candidate_x = np.concatenate(
+        [
+            np.zeros_like(phi),
+            np.full_like(phi, layer.z_half),
+            x_samples,
+            x_samples,
+        ]
+    )
+    candidate_phi = np.concatenate(
+        [
+            phi,
+            phi,
+            np.full_like(x_samples, phi[0]),
+            np.full_like(x_samples, phi[-1]),
+        ]
+    )
+    candidate_y = layer.radius * np.cos(candidate_phi)
+    candidate_z = layer.radius * np.sin(candidate_phi)
+    projected_x, projected_y, _ = proj3d.proj_transform(candidate_x, candidate_y, candidate_z, ax.get_proj())
+    display_xy = ax.transData.transform(np.column_stack([projected_x, projected_y]))
+    index = int(np.argmin(display_xy[:, 0]))
+    return float(candidate_x[index]), float(candidate_y[index]), float(candidate_z[index])
+
+
+def project_point_to_axes(ax: plt.Axes, point: tuple[float, float, float]) -> tuple[float, float]:
+    projected_x, projected_y, _ = proj3d.proj_transform(*point, ax.get_proj())
+    display_xy = ax.transData.transform((projected_x, projected_y))
+    axes_xy = ax.transAxes.inverted().transform(display_xy)
+    return float(axes_xy[0]), float(axes_xy[1])
+
+
 def draw_3d_radius_callouts(
     ax: plt.Axes,
     layers: list[BarrelLayer],
-    z_max: float,
-    r_max: float,
     unit: str,
-    phi_anchor: float,
+    phi: np.ndarray,
 ) -> None:
-    label_x = -0.72 * z_max
-    label_y = -1.42 * r_max
-    label_z_positions = np.linspace(1.10 * r_max, -0.07 * r_max, len(layers))
+    sorted_layers = sorted(layers, key=lambda item: item.radius, reverse=True)
+    target_positions = [
+        project_point_to_axes(ax, projected_leftmost_barrel_point(ax, layer, phi)) for layer in sorted_layers
+    ]
+    target_xs, target_ys = zip(*target_positions)
+    label_x = max(0.02, min(target_xs) - 0.035)
+    label_y_top = min(0.86, max(target_ys) + 0.08)
+    label_y_bottom = max(0.08, min(target_ys) - 0.14)
+    label_y_positions = np.linspace(label_y_top, label_y_bottom, len(sorted_layers))
 
-    for layer, label_z in zip(sorted(layers, key=lambda item: item.radius, reverse=True), label_z_positions):
-        target = (
-            layer.z_half,
-            layer.radius * math.cos(phi_anchor),
-            layer.radius * math.sin(phi_anchor),
-        )
-        start = (label_x, label_y, label_z)
-        ax.plot(
-            [start[0], target[0]],
-            [start[1], target[1]],
-            [start[2], target[2]],
-            color="#202020",
-            lw=0.75,
-            alpha=0.9,
-            zorder=20,
-        )
-        ax.text(
-            start[0],
-            start[1],
-            start[2],
+    for layer, target, label_y in zip(sorted_layers, target_positions, label_y_positions):
+        ax.annotate(
             fmt_radius(layer.radius, unit),
+            xy=target,
+            xycoords=ax.transAxes,
+            xytext=(label_x, float(label_y)),
+            textcoords=ax.transAxes,
             color="#111111",
             fontsize=7.5,
             ha="right",
             va="center",
-            zorder=21,
+            annotation_clip=False,
+            arrowprops={
+                "arrowstyle": "-",
+                "color": "#202020",
+                "lw": 0.75,
+                "shrinkA": 0.0,
+                "shrinkB": 0.0,
+            },
+            zorder=30,
         )
 
 
@@ -939,17 +1011,18 @@ def draw_tracker_3d(model: GeometryModel, output_path: Path, unit: str, dpi: int
     r_max = max([layer.radius for layer in tracker_layers] + [ring.r_max for ring in tracker_rings])
 
     phi = np.linspace(math.radians(24), math.radians(152), 112)
-    phi_anchor = math.radians(152)
+    tracker_light = LightSource(azdeg=315, altdeg=75)
+    surface_faces: list[list[tuple[float, float, float]]] = []
+    surface_facecolors: list[str] = []
 
-    # Draw outer layers first so the smaller inner layers remain visible.
+    # Put every tracker face in one collection so opaque layers depth-sort by
+    # where they sit in space, not by which layer loop created them.
     for layer in sorted(tracker_layers, key=lambda item: item.radius, reverse=True):
         color = SUBSYSTEM_COLORS[layer.subsystem]
         x, y, z = surface_for_cylinder(layer.radius, layer.z_half, phi)
-        ax.plot_surface(x, y, z, color=color, alpha=1.0, linewidth=0, shade=False, zorder=4)
-        ax.plot(x[:, 0], y[:, 0], z[:, 0], color=color, lw=1.1, alpha=1.0, zorder=8)
-        ax.plot(x[:, -1], y[:, -1], z[:, -1], color=color, lw=1.0, alpha=1.0, zorder=7)
-        ax.plot(x[0, :], y[0, :], z[0, :], color=color, lw=0.8, alpha=1.0, zorder=7)
-        ax.plot(x[-1, :], y[-1, :], z[-1, :], color=color, lw=0.8, alpha=1.0, zorder=7)
+        faces = surface_grid_faces(x, y, z)
+        surface_faces.extend(faces)
+        surface_facecolors.extend([color] * len(faces))
 
     grouped_rings: dict[tuple[str, str], list[EndcapRing]] = {}
     for ring in tracker_rings:
@@ -959,9 +1032,11 @@ def draw_tracker_3d(model: GeometryModel, output_path: Path, unit: str, dpi: int
         color = SUBSYSTEM_COLORS[rings[0].subsystem]
         for ring in rings:
             x, y, z = surface_for_annular_sector(ring.z, ring.r_min, ring.r_max, phi)
-            ax.plot_surface(x, y, z, color=color, alpha=1.0, linewidth=0, shade=False, zorder=5)
-            ax.plot(x[:, 0], y[:, 0], z[:, 0], color=color, lw=0.8, alpha=1.0, zorder=8)
-            ax.plot(x[:, -1], y[:, -1], z[:, -1], color=color, lw=1.0, alpha=1.0, zorder=9)
+            faces = surface_grid_faces(x, y, z)
+            surface_faces.extend(faces)
+            surface_facecolors.extend([color] * len(faces))
+
+    add_tracker_surface_collection(ax, surface_faces, surface_facecolors, tracker_light)
 
     # A slim beam line anchors the perspective without introducing non-tracker geometry.
     ax.plot([0.0, z_max * 1.03], [0.0, 0.0], [0.0, 0.0], color="#9a9a9a", lw=1.5, alpha=0.8)
@@ -970,7 +1045,6 @@ def draw_tracker_3d(model: GeometryModel, output_path: Path, unit: str, dpi: int
         round(layer.radius, 6): layer
         for layer in sorted(tracker_layers, key=lambda item: item.z_half, reverse=True)
     }
-    draw_3d_radius_callouts(ax, list(radius_layers.values()), z_max, r_max, unit, phi_anchor)
 
     legend_items = [
         Line2D([0], [0], color=SUBSYSTEM_COLORS[name], lw=5, label=name)
@@ -983,7 +1057,9 @@ def draw_tracker_3d(model: GeometryModel, output_path: Path, unit: str, dpi: int
     ax.set_ylim(-1.40 * r_max, 1.02 * r_max)
     ax.set_zlim(-0.02 * r_max, 1.16 * r_max)
     ax.set_box_aspect((1.60 * z_max, 2.42 * r_max, 1.18 * r_max))
-    ax.view_init(elev=19, azim=-122)
+    ax.view_init(elev=10, azim=-140)  # Change this to alter angle
+    fig.canvas.draw()
+    draw_3d_radius_callouts(ax, list(radius_layers.values()), unit, phi)
     ax.set_axis_off()
     fig.savefig(output_path, dpi=dpi, bbox_inches="tight", pad_inches=0.16)
     plt.close(fig)
