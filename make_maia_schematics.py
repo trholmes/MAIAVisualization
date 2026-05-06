@@ -4,16 +4,18 @@
 The script reads the MAIA_v0 geometry directory, evaluates the XML constants,
 and produces:
 
-  1. An r-z overview with pseudorapidity guide lines.
-  2. An x-y overview with detector barrel radii labeled.
-  3. A tracker-only r-z view showing Vertex, Inner Tracker, and Outer Tracker
+  1. PNG and PDF r-z overview with pseudorapidity guide lines.
+  2. PNG and PDF x-y overview with detector barrel radii labeled.
+  3. PNG and PDF tracker-only r-z view showing Vertex, Inner Tracker, and Outer Tracker
      barrel layers and endcap rings explicitly.
-  4. A tracker-only perspective schematic approximating the x-y/3D barrel view.
+  4. PNG and PDF tracker-only perspective schematic approximating the x-y/3D barrel view.
 
 Usage:
     python3 make_maia_schematics.py
     python3 make_maia_schematics.py --geometry-dir path/to/MAIA_v0
     python3 make_maia_schematics.py --output-dir figures --unit cm
+    python3 make_maia_schematics.py --full-rz-tracker layers
+    python3 make_maia_schematics.py --interactive-perspective
 """
 
 from __future__ import annotations
@@ -42,7 +44,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import LightSource
 from matplotlib.lines import Line2D
-from matplotlib.patches import Circle, Polygon, Rectangle, Wedge
+from matplotlib.patches import Circle, Polygon, Wedge
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from mpl_toolkits.mplot3d import proj3d
 
@@ -68,6 +70,11 @@ SUBSYSTEM_LABELS = {
 }
 
 TRACKER_SUBSYSTEMS = ("Vertex Detector", "Inner Tracker", "Outer Tracker")
+DEFAULT_PERSPECTIVE_ELEV = 10.0
+DEFAULT_PERSPECTIVE_AZIM = -140.0
+DEFAULT_PERSPECTIVE_ROLL = 0.0
+DEFAULT_PERSPECTIVE_FOCAL_LENGTH: float | None = None
+DEFAULT_PERSPECTIVE_DISTANCE = 10.0
 
 
 @dataclass(frozen=True)
@@ -79,6 +86,7 @@ class DetectorRegion:
     z_low: float
     z_high: float
     material: str = ""
+    r_min_high: float | None = None
 
     def scaled(self, factor: float) -> "DetectorRegion":
         return DetectorRegion(
@@ -89,6 +97,7 @@ class DetectorRegion:
             z_low=self.z_low * factor,
             z_high=self.z_high * factor,
             material=self.material,
+            r_min_high=None if self.r_min_high is None else self.r_min_high * factor,
         )
 
 
@@ -472,6 +481,7 @@ def detector_envelope_regions(constants: dict[str, float]) -> list[DetectorRegio
             constants["HCalEndcap_min_z"],
             constants["HCalEndcap_max_z"],
             "Fe + PS",
+            r_min_high=constants["HCalEndcap_inner_radius2"],
         ),
         DetectorRegion(
             "Muon Detector",
@@ -490,6 +500,7 @@ def detector_envelope_regions(constants: dict[str, float]) -> list[DetectorRegio
             constants["YokeEndcap_min_z"],
             constants["YokeEndcap_max_z"],
             "Air + RPC",
+            r_min_high=constants["YokeEndcap_inner_radius2"],
         ),
     ]
 
@@ -563,32 +574,311 @@ def matched_aspect_figure(z_limit: float, r_limit: float, width: float = 10.5) -
     return plt.subplots(figsize=(width, height), constrained_layout=True)
 
 
-def draw_region(ax: plt.Axes, region: DetectorRegion, z_max: float, r_max: float) -> None:
+def save_figure_outputs(fig: plt.Figure, output_path: Path, dpi: int, **savefig_kwargs: object) -> tuple[Path, Path]:
+    pdf_path = output_path.with_suffix(".pdf")
+    fig.savefig(output_path, dpi=dpi, **savefig_kwargs)
+    fig.savefig(pdf_path, **savefig_kwargs)
+    return output_path, pdf_path
+
+
+def nozzle_outer_radius_at(nozzles: list[NozzleProfile], z: float) -> float | None:
+    outer_radii: list[float] = []
+    for nozzle in nozzles:
+        planes = nozzle.z_planes
+        for z_plane, _, r_outer in planes:
+            if abs(z - z_plane) < 1e-9:
+                outer_radii.append(r_outer)
+        for (z0, _, r0), (z1, _, r1) in zip(planes, planes[1:]):
+            if abs(z1 - z0) < 1e-12:
+                continue
+            if min(z0, z1) <= z <= max(z0, z1):
+                fraction = (z - z0) / (z1 - z0)
+                outer_radii.append(r0 + fraction * (r1 - r0))
+                break
+    return max(outer_radii) if outer_radii else None
+
+
+def region_inner_radius_at(region: DetectorRegion, z: float) -> float:
+    if region.region != "Endcap" or region.r_min_high is None or abs(region.z_high - region.z_low) < 1e-12:
+        return region.r_min
+    fraction = (z - region.z_low) / (region.z_high - region.z_low)
+    return region.r_min + fraction * (region.r_min_high - region.r_min)
+
+
+def region_polygon_points(region: DetectorRegion, nozzles: list[NozzleProfile]) -> list[tuple[float, float]]:
+    if region.region == "Barrel":
+        z_low, z_high = 0.0, region.z_high
+    else:
+        z_low, z_high = region.z_low, region.z_high
+
+    z_samples = {z_low, z_high}
+    for nozzle in nozzles:
+        for z_plane, _, _ in nozzle.z_planes:
+            if z_low <= z_plane <= z_high:
+                z_samples.add(z_plane)
+
+    lower_edge: list[tuple[float, float]] = []
+    for z in sorted(z_samples):
+        nozzle_r = nozzle_outer_radius_at(nozzles, z)
+        geometry_inner_radius = region_inner_radius_at(region, z)
+        inner_radius = geometry_inner_radius if nozzle_r is None else max(geometry_inner_radius, nozzle_r)
+        lower_edge.append((z, min(inner_radius, region.r_max)))
+
+    return lower_edge + [(z_high, region.r_max), (z_low, region.r_max)]
+
+
+def draw_region(
+    ax: plt.Axes,
+    region: DetectorRegion,
+    z_max: float,
+    r_max: float,
+    nozzles: list[NozzleProfile],
+) -> None:
     color = SUBSYSTEM_COLORS.get(region.subsystem, "#555555")
     if region.region == "Barrel":
         x0, x1 = 0.0, region.z_high
     else:
         x0, x1 = region.z_low, region.z_high
 
-    rect = Rectangle(
-        (x0, region.r_min),
-        x1 - x0,
-        region.r_max - region.r_min,
+    polygon_points = region_polygon_points(region, nozzles)
+    polygon = Polygon(
+        polygon_points,
+        closed=True,
         facecolor=color,
         edgecolor=color,
         lw=1.8,
         alpha=0.14 if region.region == "Barrel" else 0.20,
         zorder=2 if region.region == "Barrel" else 4,
     )
-    ax.add_patch(rect)
+    ax.add_patch(polygon)
 
     width = x1 - x0
     height = region.r_max - region.r_min
     if width * height > 0.018 * z_max * r_max:
-        x_mid = 0.5 * (x0 + x1)
-        y_mid = 0.5 * (region.r_min + region.r_max)
+        x_mid = sum(point[0] for point in polygon_points) / len(polygon_points)
+        y_mid = sum(point[1] for point in polygon_points) / len(polygon_points)
         label = f"{SUBSYSTEM_LABELS.get(region.subsystem, region.subsystem)} {region.region[0]}"
         ax.text(x_mid, y_mid, label, color=color, fontsize=8.5, ha="center", va="center")
+
+
+def layer_radial_bands(
+    radii: Iterable[float],
+    fallback_width: float,
+    min_radius: float | None = None,
+    max_radius: float | None = None,
+) -> dict[float, tuple[float, float]]:
+    sorted_radii = sorted(set(round(radius, 9) for radius in radii))
+    if not sorted_radii:
+        return {}
+
+    def clamped(radius: float, lower: float, upper: float) -> tuple[float, float]:
+        if min_radius is not None:
+            lower = max(min_radius, lower)
+        if max_radius is not None:
+            upper = min(max_radius, upper)
+        if upper < lower:
+            lower = upper = radius
+        return lower, upper
+
+    if len(sorted_radii) == 1:
+        radius = sorted_radii[0]
+        half_width = 0.5 * fallback_width
+        return {radius: clamped(radius, max(0.0, radius - half_width), radius + half_width)}
+
+    bands: dict[float, tuple[float, float]] = {}
+    for index, radius in enumerate(sorted_radii):
+        if index == 0:
+            inner_gap = sorted_radii[1] - radius
+        else:
+            inner_gap = radius - sorted_radii[index - 1]
+        if index == len(sorted_radii) - 1:
+            outer_gap = radius - sorted_radii[index - 1]
+        else:
+            outer_gap = sorted_radii[index + 1] - radius
+        bands[radius] = clamped(radius, max(0.0, radius - 0.45 * inner_gap), radius + 0.45 * outer_gap)
+    return bands
+
+
+def tracker_subsystem_radial_bounds(model: GeometryModel, subsystem: str, barrel_only: bool = False) -> tuple[float, float]:
+    regions = [
+        region
+        for region in model.regions
+        if region.subsystem == subsystem and (not barrel_only or region.region == "Barrel")
+    ]
+    if not regions:
+        raise ValueError(f"No tracker regions found for {subsystem}")
+    return min(region.r_min for region in regions), max(region.r_max for region in regions)
+
+
+def nozzle_z_samples_for_radius(
+    nozzles: list[NozzleProfile],
+    z_low: float,
+    z_high: float,
+    radius: float,
+) -> set[float]:
+    z_samples = {z_low, z_high}
+    for nozzle in nozzles:
+        planes = nozzle.z_planes
+        for z_plane, _, r_outer in planes:
+            if z_low <= z_plane <= z_high:
+                z_samples.add(z_plane)
+            if abs(r_outer - radius) < 1e-9 and z_low <= z_plane <= z_high:
+                z_samples.add(z_plane)
+
+        for (z0, _, r0), (z1, _, r1) in zip(planes, planes[1:]):
+            if z1 == z0 or max(z0, z1) < z_low or min(z0, z1) > z_high:
+                continue
+            delta0 = r0 - radius
+            delta1 = r1 - radius
+            if delta0 == 0.0:
+                z_samples.add(min(max(z0, z_low), z_high))
+            if delta0 * delta1 < 0.0:
+                fraction = -delta0 / (delta1 - delta0)
+                z_crossing = z0 + fraction * (z1 - z0)
+                if z_low <= z_crossing <= z_high:
+                    z_samples.add(z_crossing)
+    return z_samples
+
+
+def nozzle_clipped_slab_points(
+    z_low: float,
+    z_high: float,
+    r_low: float,
+    r_high: float,
+    nozzles: list[NozzleProfile],
+) -> list[tuple[float, float]]:
+    z_samples = sorted(nozzle_z_samples_for_radius(nozzles, z_low, z_high, r_low))
+    lower_edge: list[tuple[float, float]] = []
+    for z in z_samples:
+        nozzle_r = nozzle_outer_radius_at(nozzles, z)
+        inner_radius = r_low if nozzle_r is None else max(r_low, nozzle_r)
+        lower_edge.append((z, min(inner_radius, r_high)))
+    upper_edge = [(z, r_high) for z in reversed(z_samples)]
+    return lower_edge + upper_edge
+
+
+def tracker_rz_envelope_polygons(
+    layers: list[BarrelLayer],
+    rings: list[EndcapRing],
+    r_max: float,
+    min_radius: float,
+    max_radius: float,
+    nozzles: list[NozzleProfile],
+) -> list[list[tuple[float, float]]]:
+    polygons: list[list[tuple[float, float]]] = []
+    barrel_layer_pad = 0.006 * r_max
+
+    for layer in layers:
+        r_low = max(min_radius, layer.radius - barrel_layer_pad)
+        r_high = min(max_radius, layer.radius + barrel_layer_pad)
+        polygons.append(
+            nozzle_clipped_slab_points(
+                0.0,
+                layer.z_half,
+                r_low,
+                r_high,
+                nozzles,
+            )
+        )
+
+    rings_by_disk: dict[tuple[str, float], list[EndcapRing]] = {}
+    for ring in rings:
+        rings_by_disk.setdefault((ring.layer_id, round(ring.z, 9)), []).append(ring)
+
+    for (_, _), disk_rings in sorted(
+        rings_by_disk.items(),
+        key=lambda item: (float(item[1][0].layer_id), item[1][0].z),
+    ):
+        ring_z = disk_rings[0].z
+        ring_r_min = min(ring.r_min for ring in disk_rings)
+        ring_r_max = max(ring.r_max for ring in disk_rings)
+        widest_ring = max(ring.r_max - ring.r_min for ring in disk_rings)
+        radial_pad = max(0.0025 * r_max, 0.03 * max(widest_ring, 0.0))
+        z_pad = max(0.003 * ring_z, 0.006 * r_max)
+        r_low = max(min_radius, max(0.0, ring_r_min - radial_pad))
+        r_high = min(max_radius, ring_r_max + radial_pad)
+        polygons.append(
+            nozzle_clipped_slab_points(
+                max(0.0, ring_z - z_pad),
+                ring_z + z_pad,
+                r_low,
+                r_high,
+                nozzles,
+            )
+        )
+
+    return polygons
+
+
+def polygon_area_and_centroid(points: list[tuple[float, float]]) -> tuple[float, tuple[float, float]]:
+    twice_area = 0.0
+    centroid_x = 0.0
+    centroid_y = 0.0
+    for point_a, point_b in zip(points, points[1:] + points[:1]):
+        cross = point_a[0] * point_b[1] - point_b[0] * point_a[1]
+        twice_area += cross
+        centroid_x += (point_a[0] + point_b[0]) * cross
+        centroid_y += (point_a[1] + point_b[1]) * cross
+
+    if abs(twice_area) < 1e-12:
+        return 0.0, (
+            sum(point[0] for point in points) / len(points),
+            sum(point[1] for point in points) / len(points),
+        )
+
+    area = 0.5 * twice_area
+    return abs(area), (centroid_x / (3.0 * twice_area), centroid_y / (3.0 * twice_area))
+
+
+def draw_tracker_rz_envelopes(
+    ax: plt.Axes,
+    model: GeometryModel,
+    z_max: float,
+    r_max: float,
+    alpha: float = 0.16,
+    zorder: int = 3,
+    label: bool = True,
+) -> None:
+    for subsystem in TRACKER_SUBSYSTEMS:
+        layers = [layer for layer in model.barrel_layers if layer.subsystem == subsystem]
+        rings = [ring for ring in model.endcap_rings if ring.subsystem == subsystem]
+        min_radius, max_radius = tracker_subsystem_radial_bounds(model, subsystem)
+        polygons = tracker_rz_envelope_polygons(layers, rings, r_max, min_radius, max_radius, model.nozzles)
+        polygons = [polygon for polygon in polygons if len(polygon) >= 3]
+        if not polygons:
+            continue
+
+        color = SUBSYSTEM_COLORS[subsystem]
+        for polygon_points in polygons:
+            ax.add_patch(
+                Polygon(
+                    polygon_points,
+                    closed=True,
+                    facecolor=color,
+                    edgecolor=color,
+                    lw=0.8,
+                    alpha=alpha,
+                    zorder=zorder,
+                )
+            )
+
+        if not label:
+            continue
+
+        areas_and_centroids = [polygon_area_and_centroid(polygon_points) for polygon_points in polygons]
+        total_area = sum(area for area, _ in areas_and_centroids)
+        if total_area > 0.018 * z_max * r_max:
+            centroid_x = sum(area * centroid[0] for area, centroid in areas_and_centroids) / total_area
+            centroid_y = sum(area * centroid[1] for area, centroid in areas_and_centroids) / total_area
+            ax.text(
+                centroid_x,
+                centroid_y,
+                SUBSYSTEM_LABELS.get(subsystem, subsystem),
+                color=color,
+                fontsize=8.5,
+                ha="center",
+                va="center",
+            )
 
 
 def nozzle_style(nozzle: NozzleProfile) -> tuple[str, float]:
@@ -636,7 +926,85 @@ def draw_nozzles(ax: plt.Axes, nozzles: list[NozzleProfile], z_clip: float, zord
         )
 
 
-def draw_rz(model: GeometryModel, output_path: Path, unit: str, etas: list[float], dpi: int) -> None:
+def draw_tracker_rz_layer_lines(
+    ax: plt.Axes,
+    model: GeometryModel,
+    z_max: float,
+    r_max: float,
+    label: bool = True,
+    barrel_zorder: int = 3,
+    endcap_zorder: int = 4,
+    linewidth_scale: float = 1.0,
+) -> None:
+    subsystem_order = {name: index for index, name in enumerate(TRACKER_SUBSYSTEMS)}
+
+    def layer_key(layer: BarrelLayer | EndcapRing) -> tuple[int, float]:
+        return (subsystem_order.get(layer.subsystem, 99), float(layer.layer_id))
+
+    for layer in sorted(model.barrel_layers, key=layer_key):
+        color = SUBSYSTEM_COLORS[layer.subsystem]
+        ax.plot(
+            [0.0, layer.z_half],
+            [layer.radius, layer.radius],
+            color=color,
+            lw=2.1 * linewidth_scale,
+            zorder=barrel_zorder,
+        )
+        if label and layer.radius > 0.055 * r_max:
+            ax.text(
+                max(0.012 * z_max, layer.z_half - 0.020 * z_max),
+                layer.radius,
+                f"B{layer.layer_id}",
+                color=color,
+                fontsize=7.5,
+                va="center",
+                ha="right",
+            )
+
+    grouped_endcap_layers: dict[tuple[str, str], list[EndcapRing]] = {}
+    for ring in model.endcap_rings:
+        grouped_endcap_layers.setdefault((ring.subsystem, ring.layer_id), []).append(ring)
+
+    for label_index, ((subsystem, layer_id), rings) in enumerate(
+        sorted(grouped_endcap_layers.items(), key=lambda item: layer_key(item[1][0]))
+    ):
+        color = SUBSYSTEM_COLORS[subsystem]
+        for ring in rings:
+            ax.plot(
+                [ring.z, ring.z],
+                [ring.r_min, ring.r_max],
+                color=color,
+                lw=2.0 * linewidth_scale,
+                solid_capstyle="butt",
+                zorder=endcap_zorder,
+            )
+        if not label:
+            continue
+        z = rings[0].z
+        r_label = max(ring.r_max for ring in rings)
+        compact_vertex = subsystem == "Vertex Detector"
+        x_offset = ((label_index % 3) - 1) * 0.012 * z_max if compact_vertex else 0.0
+        y_offset = (0.016 + 0.012 * (label_index % 2)) * r_max if compact_vertex else 0.018 * r_max
+        ax.text(
+            z + x_offset,
+            r_label + y_offset,
+            f"E{layer_id}",
+            color=color,
+            fontsize=7.5,
+            ha="center",
+            va="bottom",
+            rotation=0 if compact_vertex else 90,
+        )
+
+
+def draw_rz(
+    model: GeometryModel,
+    output_path: Path,
+    unit: str,
+    etas: list[float],
+    dpi: int,
+    tracker_style: str,
+) -> tuple[Path, Path]:
     z_max = max(region.z_high for region in model.regions)
     r_max = max(region.r_max for region in model.regions)
     z_limit = z_max * 1.08
@@ -646,7 +1014,22 @@ def draw_rz(model: GeometryModel, output_path: Path, unit: str, etas: list[float
     draw_eta_guides(ax, etas, z_max, r_max)
 
     for region in model.regions:
-        draw_region(ax, region, z_max, r_max)
+        if region.subsystem in TRACKER_SUBSYSTEMS:
+            continue
+        draw_region(ax, region, z_max, r_max, model.nozzles)
+    if tracker_style == "layers":
+        draw_tracker_rz_layer_lines(
+            ax,
+            model,
+            z_max,
+            r_max,
+            label=False,
+            barrel_zorder=5,
+            endcap_zorder=5,
+            linewidth_scale=0.85,
+        )
+    else:
+        draw_tracker_rz_envelopes(ax, model, z_max, r_max)
 
     draw_nozzles(ax, model.nozzles, z_max)
 
@@ -672,8 +1055,9 @@ def draw_rz(model: GeometryModel, output_path: Path, unit: str, etas: list[float
     ax.set_aspect("equal", adjustable="box")
     ax.grid(True, color="#ededed", lw=0.7)
     ax.spines[["top", "right"]].set_visible(False)
-    fig.savefig(output_path, dpi=dpi)
+    saved_paths = save_figure_outputs(fig, output_path, dpi)
     plt.close(fig)
+    return saved_paths
 
 
 def boundary_radii(model: GeometryModel, source: str) -> list[float]:
@@ -685,7 +1069,39 @@ def boundary_radii(model: GeometryModel, source: str) -> list[float]:
     return [float(value) for value in sorted(region_radii | layer_radii)]
 
 
-def draw_xy(model: GeometryModel, output_path: Path, unit: str, label_source: str, dpi: int) -> None:
+def draw_tracker_xy_layer_bands(ax: plt.Axes, model: GeometryModel, r_max: float) -> None:
+    for subsystem in TRACKER_SUBSYSTEMS:
+        layers = [layer for layer in model.barrel_layers if layer.subsystem == subsystem]
+        if not layers:
+            continue
+
+        color = SUBSYSTEM_COLORS[subsystem]
+        min_radius, max_radius = tracker_subsystem_radial_bounds(model, subsystem, barrel_only=True)
+        bands = layer_radial_bands(
+            (layer.radius for layer in layers),
+            0.006 * r_max,
+            min_radius=min_radius,
+            max_radius=max_radius,
+        )
+        for radius in sorted(bands):
+            r_inner, r_outer = bands[radius]
+            width = max(r_outer - r_inner, 0.001 * r_max)
+            ax.add_patch(
+                Wedge(
+                    (0.0, 0.0),
+                    r_outer,
+                    0.0,
+                    360.0,
+                    width=width,
+                    facecolor=color,
+                    edgecolor=color,
+                    lw=0.7,
+                    alpha=0.13,
+                )
+            )
+
+
+def draw_xy(model: GeometryModel, output_path: Path, unit: str, label_source: str, dpi: int) -> tuple[Path, Path]:
     barrel_regions = [region for region in model.regions if region.region == "Barrel"]
     if not barrel_regions:
         raise ValueError("No barrel rows were found for the x-y view.")
@@ -694,6 +1110,8 @@ def draw_xy(model: GeometryModel, output_path: Path, unit: str, label_source: st
     r_max = max(region.r_max for region in model.regions)
 
     for region in sorted(barrel_regions, key=lambda item: item.r_max, reverse=True):
+        if region.subsystem in TRACKER_SUBSYSTEMS:
+            continue
         color = SUBSYSTEM_COLORS.get(region.subsystem, "#555555")
         width = max(region.r_max - region.r_min, 0.001 * r_max)
         annulus = Wedge(
@@ -710,6 +1128,8 @@ def draw_xy(model: GeometryModel, output_path: Path, unit: str, label_source: st
         ax.add_patch(annulus)
         ax.add_patch(Circle((0.0, 0.0), region.r_min, fill=False, edgecolor=color, lw=1.0, alpha=0.75))
         ax.add_patch(Circle((0.0, 0.0), region.r_max, fill=False, edgecolor=color, lw=1.6, alpha=0.95))
+
+    draw_tracker_xy_layer_bands(ax, model, r_max)
 
     for layer in model.barrel_layers:
         color = SUBSYSTEM_COLORS.get(layer.subsystem, "#555555")
@@ -751,11 +1171,12 @@ def draw_xy(model: GeometryModel, output_path: Path, unit: str, label_source: st
     ax.set_aspect("equal", adjustable="box")
     ax.grid(True, color="#eeeeee", lw=0.7)
     ax.spines[["top", "right"]].set_visible(False)
-    fig.savefig(output_path, dpi=dpi)
+    saved_paths = save_figure_outputs(fig, output_path, dpi)
     plt.close(fig)
+    return saved_paths
 
 
-def draw_tracker_layers(model: GeometryModel, output_path: Path, unit: str, etas: list[float], dpi: int) -> None:
+def draw_tracker_layers(model: GeometryModel, output_path: Path, unit: str, etas: list[float], dpi: int) -> tuple[Path, Path]:
     tracker_regions_only = [region for region in model.regions if region.subsystem in TRACKER_SUBSYSTEMS]
     z_max = max(
         [region.z_high for region in tracker_regions_only]
@@ -773,77 +1194,11 @@ def draw_tracker_layers(model: GeometryModel, output_path: Path, unit: str, etas
 
     draw_eta_guides(ax, etas, z_max, r_max)
 
-    for region in tracker_regions_only:
-        color = SUBSYSTEM_COLORS[region.subsystem]
-        if region.region == "Barrel":
-            rect = Rectangle(
-                (0.0, region.r_min),
-                region.z_high,
-                region.r_max - region.r_min,
-                facecolor=color,
-                edgecolor="none",
-                alpha=0.045,
-                zorder=1,
-            )
-        else:
-            rect = Rectangle(
-                (region.z_low, region.r_min),
-                region.z_high - region.z_low,
-                region.r_max - region.r_min,
-                facecolor=color,
-                edgecolor="none",
-                alpha=0.055,
-                zorder=1,
-            )
-        ax.add_patch(rect)
+    draw_tracker_rz_envelopes(ax, model, z_max, r_max, alpha=0.07, zorder=1, label=False)
 
     draw_nozzles(ax, model.nozzles, z_limit, zorder=2)
 
-    subsystem_order = {name: index for index, name in enumerate(TRACKER_SUBSYSTEMS)}
-
-    def layer_key(layer: BarrelLayer | EndcapRing) -> tuple[int, float]:
-        return (subsystem_order.get(layer.subsystem, 99), float(layer.layer_id))
-
-    for layer in sorted(model.barrel_layers, key=layer_key):
-        color = SUBSYSTEM_COLORS[layer.subsystem]
-        ax.plot([0.0, layer.z_half], [layer.radius, layer.radius], color=color, lw=2.1, zorder=3)
-        ax.plot([layer.z_half, layer.z_half], [layer.radius - 0.012 * r_max, layer.radius + 0.012 * r_max], color=color, lw=1.2)
-        if layer.radius > 0.055 * r_max:
-            ax.text(
-                max(0.012 * z_max, layer.z_half - 0.020 * z_max),
-                layer.radius,
-                f"B{layer.layer_id}",
-                color=color,
-                fontsize=7.5,
-                va="center",
-                ha="right",
-            )
-
-    grouped_endcap_layers: dict[tuple[str, str], list[EndcapRing]] = {}
-    for ring in model.endcap_rings:
-        grouped_endcap_layers.setdefault((ring.subsystem, ring.layer_id), []).append(ring)
-
-    for label_index, ((subsystem, layer_id), rings) in enumerate(
-        sorted(grouped_endcap_layers.items(), key=lambda item: layer_key(item[1][0]))
-    ):
-        color = SUBSYSTEM_COLORS[subsystem]
-        z = rings[0].z
-        for ring in rings:
-            ax.plot([ring.z, ring.z], [ring.r_min, ring.r_max], color=color, lw=2.0, solid_capstyle="butt", zorder=4)
-        r_label = max(ring.r_max for ring in rings)
-        compact_vertex = subsystem == "Vertex Detector"
-        x_offset = ((label_index % 3) - 1) * 0.012 * z_max if compact_vertex else 0.0
-        y_offset = (0.016 + 0.012 * (label_index % 2)) * r_max if compact_vertex else 0.018 * r_max
-        ax.text(
-            z + x_offset,
-            r_label + y_offset,
-            f"E{layer_id}",
-            color=color,
-            fontsize=7.5,
-            ha="center",
-            va="bottom",
-            rotation=0 if compact_vertex else 90,
-        )
+    draw_tracker_rz_layer_lines(ax, model, z_max, r_max)
 
     legend_items = [
         Line2D([0], [0], color=SUBSYSTEM_COLORS[name], lw=3, label=name)
@@ -862,8 +1217,9 @@ def draw_tracker_layers(model: GeometryModel, output_path: Path, unit: str, etas
     ax.set_aspect("equal", adjustable="box")
     ax.grid(True, color="#eeeeee", lw=0.7)
     ax.spines[["top", "right"]].set_visible(False)
-    fig.savefig(output_path, dpi=dpi)
+    saved_paths = save_figure_outputs(fig, output_path, dpi)
     plt.close(fig)
+    return saved_paths
 
 
 def tracker_layer_sort_key(layer: BarrelLayer | EndcapRing) -> tuple[int, float]:
@@ -1001,7 +1357,61 @@ def draw_3d_radius_callouts(
         )
 
 
-def draw_tracker_3d(model: GeometryModel, output_path: Path, unit: str, dpi: int) -> None:
+def backend_supports_interactive_window() -> bool:
+    backend = plt.get_backend().lower()
+    noninteractive_backends = {"agg", "cairo", "pdf", "pgf", "ps", "svg", "template"}
+    return backend not in noninteractive_backends and "inline" not in backend
+
+
+def format_angle(value: float) -> str:
+    return f"{0.0 if abs(value) < 5e-7 else value:.6g}"
+
+
+def positive_float(value: str) -> float:
+    numeric_value = float(value)
+    if numeric_value <= 0.0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return numeric_value
+
+
+def perspective_view_options(ax: plt.Axes, focal_length: float | None, distance: float) -> str:
+    options = (
+        f"--perspective-elev {format_angle(float(ax.elev))} "
+        f"--perspective-azim {format_angle(float(ax.azim))} "
+        f"--perspective-roll {format_angle(float(getattr(ax, 'roll', 0.0)))} "
+        f"--perspective-distance {format_angle(distance)}"
+    )
+    if focal_length is not None:
+        options += f" --perspective-focal-length {format_angle(focal_length)}"
+    return options
+
+
+def pause_for_interactive_view(fig: plt.Figure) -> None:
+    try:
+        fig.canvas.manager.set_window_title("Adjust MAIA tracker perspective")
+    except AttributeError:
+        pass
+    print("Interactive perspective mode: rotate the 3D window, then press Enter here to save.")
+    plt.show(block=False)
+    plt.pause(0.1)
+    try:
+        input("Press Enter to save the perspective view...")
+    except EOFError:
+        print("No terminal input was available; saving the current perspective view.")
+
+
+def draw_tracker_3d(
+    model: GeometryModel,
+    output_path: Path,
+    unit: str,
+    dpi: int,
+    interactive: bool = False,
+    perspective_elev: float = DEFAULT_PERSPECTIVE_ELEV,
+    perspective_azim: float = DEFAULT_PERSPECTIVE_AZIM,
+    perspective_roll: float = DEFAULT_PERSPECTIVE_ROLL,
+    perspective_focal_length: float | None = DEFAULT_PERSPECTIVE_FOCAL_LENGTH,
+    perspective_distance: float = DEFAULT_PERSPECTIVE_DISTANCE,
+) -> tuple[Path, Path]:
     fig = plt.figure(figsize=(12.2, 8.4), constrained_layout=True)
     ax = fig.add_subplot(111, projection="3d")
 
@@ -1057,12 +1467,30 @@ def draw_tracker_3d(model: GeometryModel, output_path: Path, unit: str, dpi: int
     ax.set_ylim(-1.40 * r_max, 1.02 * r_max)
     ax.set_zlim(-0.02 * r_max, 1.16 * r_max)
     ax.set_box_aspect((1.60 * z_max, 2.42 * r_max, 1.18 * r_max))
-    ax.view_init(elev=10, azim=-140)  # Change this to alter angle
-    fig.canvas.draw()
-    draw_3d_radius_callouts(ax, list(radius_layers.values()), unit, phi)
+    ax.view_init(elev=perspective_elev, azim=perspective_azim, roll=perspective_roll)
+    ax._dist = perspective_distance
+    if perspective_focal_length is not None:
+        ax.set_proj_type("persp", focal_length=perspective_focal_length)
     ax.set_axis_off()
-    fig.savefig(output_path, dpi=dpi, bbox_inches="tight", pad_inches=0.16)
+    fig.canvas.draw()
+
+    if interactive:
+        if backend_supports_interactive_window():
+            pause_for_interactive_view(fig)
+            fig.canvas.draw()
+        else:
+            print(
+                f"Requested --interactive-perspective, but Matplotlib backend "
+                f"{plt.get_backend()!r} cannot open an interactive window. Saving the default view."
+            )
+
+    draw_3d_radius_callouts(ax, list(radius_layers.values()), unit, phi)
+    saved_paths = save_figure_outputs(fig, output_path, dpi, bbox_inches="tight", pad_inches=0.16)
+    if interactive:
+        print("Perspective options for this saved view:")
+        print(f"  {perspective_view_options(ax, perspective_focal_length, perspective_distance)}")
     plt.close(fig)
+    return saved_paths
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1098,7 +1526,48 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="barrel",
         help="Which detector-region R boundaries to label in the x-y plot.",
     )
+    parser.add_argument(
+        "--full-rz-tracker",
+        choices=("boxes", "layers"),
+        default="layers",
+        help="Draw tracker envelopes or explicit tracker layer lines in the full r-z detector view.",
+    )
     parser.add_argument("--dpi", type=int, default=220, help="Output image resolution.")
+    parser.add_argument(
+        "--interactive-perspective",
+        action="store_true",
+        help="Open the tracker perspective plot for manual rotation before saving it.",
+    )
+    parser.add_argument(
+        "--perspective-elev",
+        type=float,
+        default=DEFAULT_PERSPECTIVE_ELEV,
+        help="Elevation angle for the tracker perspective view.",
+    )
+    parser.add_argument(
+        "--perspective-azim",
+        type=float,
+        default=DEFAULT_PERSPECTIVE_AZIM,
+        help="Azimuth angle for the tracker perspective view.",
+    )
+    parser.add_argument(
+        "--perspective-roll",
+        type=float,
+        default=DEFAULT_PERSPECTIVE_ROLL,
+        help="Roll angle for the tracker perspective view.",
+    )
+    parser.add_argument(
+        "--perspective-focal-length",
+        type=positive_float,
+        default=DEFAULT_PERSPECTIVE_FOCAL_LENGTH,
+        help="Perspective focal length. Smaller values give a stronger wide-angle/inside-camera effect.",
+    )
+    parser.add_argument(
+        "--perspective-distance",
+        type=positive_float,
+        default=DEFAULT_PERSPECTIVE_DISTANCE,
+        help="3D camera distance for the tracker perspective view. Smaller values feel closer/inside.",
+    )
     return parser
 
 
@@ -1114,16 +1583,27 @@ def main() -> None:
     tracker_path = args.output_dir / f"maia_tracker_layers_rz.{args.unit}.png"
     tracker_3d_path = args.output_dir / f"maia_tracker_perspective.{args.unit}.png"
 
-    draw_rz(model, rz_path, args.unit, etas, args.dpi)
-    draw_xy(model, xy_path, args.unit, args.xy_radii, args.dpi)
-    draw_tracker_layers(model, tracker_path, args.unit, etas, args.dpi)
-    draw_tracker_3d(model, tracker_3d_path, args.unit, args.dpi)
+    written_paths = [
+        *draw_rz(model, rz_path, args.unit, etas, args.dpi, args.full_rz_tracker),
+        *draw_xy(model, xy_path, args.unit, args.xy_radii, args.dpi),
+        *draw_tracker_layers(model, tracker_path, args.unit, etas, args.dpi),
+        *draw_tracker_3d(
+            model,
+            tracker_3d_path,
+            args.unit,
+            args.dpi,
+            args.interactive_perspective,
+            args.perspective_elev,
+            args.perspective_azim,
+            args.perspective_roll,
+            args.perspective_focal_length,
+            args.perspective_distance,
+        ),
+    ]
 
     print(f"Read geometry from {args.geometry_dir}")
-    print(f"Wrote {rz_path}")
-    print(f"Wrote {xy_path}")
-    print(f"Wrote {tracker_path}")
-    print(f"Wrote {tracker_3d_path}")
+    for path in written_paths:
+        print(f"Wrote {path}")
 
 
 if __name__ == "__main__":
