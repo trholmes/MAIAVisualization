@@ -941,7 +941,77 @@ def draw_tracker_rz_layer_lines(
     def layer_key(layer: BarrelLayer | EndcapRing) -> tuple[int, float]:
         return (subsystem_order.get(layer.subsystem, 99), float(layer.layer_id))
 
-    for layer in sorted(model.barrel_layers, key=layer_key):
+    def label_vertex_barrel_layers(layers: list[BarrelLayer]) -> None:
+        consumed: set[int] = set()
+        sorted_layers = sorted(layers, key=lambda item: item.radius)
+        for index, layer in enumerate(sorted_layers):
+            if index in consumed:
+                continue
+
+            paired_layer: BarrelLayer | None = None
+            for other_index in range(index + 1, len(sorted_layers)):
+                other_layer = sorted_layers[other_index]
+                if abs(other_layer.radius - layer.radius) < 0.010 * r_max:
+                    paired_layer = other_layer
+                    consumed.add(other_index)
+                    break
+
+            label_text = f"B{layer.layer_id}"
+            label_radius = layer.radius
+            if paired_layer is not None:
+                label_text = f"B{layer.layer_id}/{paired_layer.layer_id}"
+                label_radius = 0.5 * (layer.radius + paired_layer.radius)
+
+            ax.text(
+                -0.006 * z_max,
+                label_radius,
+                label_text,
+                color=SUBSYSTEM_COLORS[layer.subsystem],
+                fontsize=7.5,
+                va="center",
+                ha="right",
+                clip_on=False,
+            )
+
+    def label_endcap_groups(
+        subsystem: str,
+        grouped_layers: list[tuple[str, list[EndcapRing]]],
+    ) -> list[tuple[str, list[EndcapRing]]]:
+        if subsystem != "Vertex Detector":
+            return grouped_layers
+
+        label_groups: list[tuple[str, list[EndcapRing]]] = []
+        consumed: set[int] = set()
+        for index, (layer_id, rings) in enumerate(grouped_layers):
+            if index in consumed:
+                continue
+
+            match_index: int | None = None
+            z = rings[0].z
+            r_min = min(ring.r_min for ring in rings)
+            r_max_local = max(ring.r_max for ring in rings)
+            for other_index in range(index + 1, len(grouped_layers)):
+                other_layer_id, other_rings = grouped_layers[other_index]
+                other_z = other_rings[0].z
+                other_r_min = min(ring.r_min for ring in other_rings)
+                other_r_max = max(ring.r_max for ring in other_rings)
+                same_span = abs(other_r_min - r_min) < 1e-9 and abs(other_r_max - r_max_local) < 1e-9
+                if same_span and abs(other_z - z) < 0.020 * z_max:
+                    match_index = other_index
+                    break
+
+            if match_index is None:
+                label_groups.append((layer_id, rings))
+                continue
+
+            other_layer_id, other_rings = grouped_layers[match_index]
+            consumed.add(match_index)
+            label_groups.append((f"{layer_id}/{other_layer_id}", rings + other_rings))
+
+        return label_groups
+
+    sorted_barrel_layers = sorted(model.barrel_layers, key=layer_key)
+    for layer in sorted_barrel_layers:
         color = SUBSYSTEM_COLORS[layer.subsystem]
         ax.plot(
             [0.0, layer.z_half],
@@ -950,23 +1020,40 @@ def draw_tracker_rz_layer_lines(
             lw=2.1 * linewidth_scale,
             zorder=barrel_zorder,
         )
-        if label and layer.radius > 0.055 * r_max:
+        if not label:
+            continue
+        if layer.subsystem == "Vertex Detector":
+            continue
+        elif layer.radius > 0.055 * r_max:
             ax.text(
                 max(0.012 * z_max, layer.z_half - 0.020 * z_max),
-                layer.radius,
+                layer.radius + 0.010 * r_max,
                 f"B{layer.layer_id}",
                 color=color,
                 fontsize=7.5,
-                va="center",
+                va="bottom",
                 ha="right",
             )
+
+    if label:
+        label_vertex_barrel_layers([layer for layer in sorted_barrel_layers if layer.subsystem == "Vertex Detector"])
 
     grouped_endcap_layers: dict[tuple[str, str], list[EndcapRing]] = {}
     for ring in model.endcap_rings:
         grouped_endcap_layers.setdefault((ring.subsystem, ring.layer_id), []).append(ring)
 
-    for label_index, ((subsystem, layer_id), rings) in enumerate(
-        sorted(grouped_endcap_layers.items(), key=lambda item: layer_key(item[1][0]))
+    grouped_by_subsystem: dict[str, list[tuple[str, list[EndcapRing]]]] = {}
+    for (subsystem, layer_id), rings in grouped_endcap_layers.items():
+        grouped_by_subsystem.setdefault(subsystem, []).append((layer_id, rings))
+
+    label_items: list[tuple[int, str, str, list[EndcapRing]]] = []
+    for subsystem, grouped_layers in grouped_by_subsystem.items():
+        ordered_layers = sorted(grouped_layers, key=lambda item: layer_key(item[1][0]))
+        for layer_id, rings in label_endcap_groups(subsystem, ordered_layers):
+            label_items.append((subsystem_order.get(subsystem, 99), subsystem, layer_id, rings))
+
+    for label_index, (_, subsystem, layer_id, rings) in enumerate(
+        sorted(label_items, key=lambda item: (item[0], float(item[2].split("/")[0])))
     ):
         color = SUBSYSTEM_COLORS[subsystem]
         for ring in rings:
@@ -980,7 +1067,7 @@ def draw_tracker_rz_layer_lines(
             )
         if not label:
             continue
-        z = rings[0].z
+        z = sum(ring.z for ring in rings) / len(rings)
         r_label = max(ring.r_max for ring in rings)
         compact_vertex = subsystem == "Vertex Detector"
         x_offset = ((label_index % 3) - 1) * 0.012 * z_max if compact_vertex else 0.0
